@@ -50,10 +50,10 @@ using namespace aditof;
 
 namespace local {
 
-aditof::Status findDevicePathsAtVideo(const std::string &video,
-                                      std::string &dev_path,
-                                      std::string &subdev_path,
-                                      std::string &device_name) {
+aditof::Status findDevicePathsAtMedia(const std::string &media,
+                                      std::vector<std::string> &dev_paths,
+                                      std::vector<std::string> &subdev_paths,
+                                      std::vector<std::string> &device_names) {
     using namespace aditof;
     using namespace std;
 
@@ -62,7 +62,7 @@ aditof::Status findDevicePathsAtVideo(const std::string &video,
 
     /* Run media-ctl to get the video processing pipes */
     char cmd[64];
-    sprintf(cmd, "media-ctl -d %s --print-dot", video.c_str());
+    sprintf(cmd, "media-ctl -d %s --print-dot", media.c_str());
     FILE *fp = popen(cmd, "r");
     if (!fp) {
         LOG(WARNING) << "Error running media-ctl";
@@ -78,26 +78,46 @@ aditof::Status findDevicePathsAtVideo(const std::string &video,
     pclose(fp);
     buf[size] = '\0';
 
-    /* Search command media-ctl for device/subdevice name */
+    /* Search command media-ctl for device/subdevice names */
     string str(buf);
     free(buf);
 
-    size_t pos = str.find("vi-output, adsd3500");
-    if (pos != string::npos) {
-        dev_path = str.substr(pos + strlen("vi-output, adsd3500") + 9,
-                              strlen("/dev/mediaX"));
-    } else {
-        return Status::GENERIC_ERROR;
+    size_t pos = 0;
+    while ((pos = str.find("vi-output, adsd3500", pos)) != string::npos) {
+        size_t start = str.find("/dev/video", pos);
+        if (start != string::npos) {
+            string dev_path = str.substr(start, strlen("/dev/videoX"));
+            dev_paths.push_back(dev_path);
+        }
+        pos += strlen("vi-output, adsd3500");
     }
 
-    if (str.find("adsd3500") != string::npos) {
-        device_name = "adsd3500";
-        pos = str.find("adsd3500");
-        subdev_path = str.substr(pos + strlen("adsd3500") + 9,
-                                 strlen("/dev/v4l-subdevX"));
-    } else {
-        return Status::GENERIC_ERROR;
+    // pos = 0;
+    // while ((pos = str.find("adsd3500", pos)) != string::npos) {
+    //     size_t start = str.find("/dev/v4l-subdev", pos);
+    //     if (start != string::npos) {
+    //         string subdev_path = str.substr(start, strlen("/dev/v4l-subdevX"));
+    //         subdev_paths.push_back(subdev_path);
+    //         device_names.push_back("adsd3500");
+    //         LOG(INFO) << "subdev " << subdev_path << "part of adsd3500 test";
+    //     }
+    //     pos += strlen("adsd3500");
+    // }
+
+    pos = 0;
+    while ((pos = str.find("/dev/v4l-subdev", pos)) != std::string::npos) {
+        // Look 60 characters before the found position for "adsd3500"
+        size_t contextStart = (pos >= 60 ? pos - 60 : 0);
+        std::string context = str.substr(contextStart, pos - contextStart);
+        if (context.find("adsd3500") != std::string::npos) {
+            std::string subdev_path = str.substr(pos, strlen("/dev/v4l-subdevX"));
+            LOG(INFO) << "subdev " << subdev_path << "part of adsd3500 test";
+            subdev_paths.push_back(subdev_path);
+            device_names.push_back("adsd3500");
+        }
+    pos += strlen("/dev/v4l-subdevX");
     }
+
     return Status::OK;
 }
 
@@ -106,55 +126,54 @@ aditof::Status findDevicePathsAtVideo(const std::string &video,
 Status TargetSensorEnumerator::searchSensors() {
     Status status = Status::OK;
 
-    LOG(INFO) << "Looking for sensors on the target";
+    LOG(INFO) << "Looking for sensors on the target - Loek";
 
-    // Find all video device paths
-    std::vector<std::string> videoPaths;
-    const std::string videoDirPath("/dev/");
-    const std::string videoBaseName("media");
+    // Find all media device paths
+    std::vector<std::string> mediaPaths;
+    const std::string mediaDirPath("/dev/");
+    const std::string mediaBaseName("media");
     std::string deviceName;
 
-    DIR *dirp = opendir(videoDirPath.c_str());
+    DIR *dirp = opendir(mediaDirPath.c_str());
     struct dirent *dp;
     while ((dp = readdir(dirp))) {
-        if (!strncmp(dp->d_name, videoBaseName.c_str(),
-                     videoBaseName.length())) {
-            std::string fullvideoPath = videoDirPath + std::string(dp->d_name);
-            videoPaths.emplace_back(fullvideoPath);
+        if (!strncmp(dp->d_name, mediaBaseName.c_str(),
+                     mediaBaseName.length())) {
+            std::string fullMediaPath = mediaDirPath + std::string(dp->d_name);
+            mediaPaths.emplace_back(fullMediaPath);
         }
     }
     closedir(dirp);
 
     // Identify any eligible time of flight cameras
-    for (const auto &video : videoPaths) {
-        DLOG(INFO) << "Looking at: " << video << " for an eligible TOF camera";
+    for (const auto &media : mediaPaths) {
+        DLOG(INFO) << "Looking at: " << media << " for an eligible TOF camera";
 
-        std::string devPath;
-        std::string subdevPath;
+        std::vector<std::string> devPaths;
+        std::vector<std::string> subdevPaths;
+        std::vector<std::string> deviceNames;
 
-        status = local::findDevicePathsAtVideo(video, devPath, subdevPath,
-                                               deviceName);
+        status = local::findDevicePathsAtMedia(media, devPaths, subdevPaths,
+                                               deviceNames);
         if (status != Status::OK) {
-            LOG(WARNING) << "failed to find device paths at video: " << video;
-            return status;
-        }
-
-        if (devPath.empty() || subdevPath.empty()) {
+            LOG(WARNING) << "failed to find device paths at media: " << media;
             continue;
         }
 
-        DLOG(INFO) << "Considering: " << video << " an eligible TOF camera";
+        for (size_t i = 0; i < devPaths.size(); ++i) {
+            DLOG(INFO) << "Considering: " << devPaths[i] << " an eligible TOF camera";
 
-        SensorInfo sInfo;
+            SensorInfo sInfo;
 
-        if (deviceName == "adsd3500") {
-            sInfo.sensorType = SensorType::SENSOR_ADSD3500;
+            if (deviceNames[i] == "adsd3500") {
+                sInfo.sensorType = SensorType::SENSOR_ADSD3500;
+            }
+
+            sInfo.driverPath = devPaths[i];
+            sInfo.subDevPath = subdevPaths[i];
+            sInfo.captureDev = CAPTURE_DEVICE_NAME;
+            m_sensorsInfo.emplace_back(sInfo);
         }
-
-        sInfo.driverPath = devPath;
-        sInfo.subDevPath = subdevPath;
-        sInfo.captureDev = CAPTURE_DEVICE_NAME;
-        m_sensorsInfo.emplace_back(sInfo);
     }
 
     return status;
