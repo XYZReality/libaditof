@@ -160,19 +160,35 @@ Status TargetSensorEnumerator::searchSensors() {
             continue;
         }
 
+        // Validate that we have matching pairs of devices and subdevices
+        if (devPaths.size() != subdevPaths.size() || devPaths.size() != deviceNames.size()) {
+            LOG(ERROR) << "Mismatch in device discovery at media: " << media
+                       << " devPaths=" << devPaths.size() 
+                       << " subdevPaths=" << subdevPaths.size()
+                       << " deviceNames=" << deviceNames.size();
+            continue;
+        }
+
         for (size_t i = 0; i < devPaths.size(); ++i) {
-            DLOG(INFO) << "Considering: " << devPaths[i] << " an eligible TOF camera";
+            DLOG(INFO) << "Considering: " << devPaths[i] << " with subdev: " 
+                       << subdevPaths[i] << " as eligible TOF camera";
 
             SensorInfo sInfo;
 
             if (deviceNames[i] == "adsd3500") {
                 sInfo.sensorType = SensorType::SENSOR_ADSD3500;
+            } else {
+                LOG(WARNING) << "Unknown device type: " << deviceNames[i];
+                continue;
             }
 
             sInfo.driverPath = devPaths[i];
             sInfo.subDevPath = subdevPaths[i];
             sInfo.captureDev = CAPTURE_DEVICE_NAME;
             m_sensorsInfo.emplace_back(sInfo);
+            
+            LOG(INFO) << "Added sensor: video=" << sInfo.driverPath 
+                      << " subdev=" << sInfo.subDevPath;
         }
     }
 

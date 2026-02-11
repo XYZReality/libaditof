@@ -45,9 +45,15 @@ FrameHandlerImpl::FrameHandlerImpl()
     : m_concatFrames(true), m_enableMultithreading(false),
       m_customFormat(false), m_bitsInDepth(0), m_bitsInAB(0), m_bitsInConf(0),
       m_frameWidth(0), m_frameHeight(0), m_frameIndex(0), m_fileCreated(false),
-      m_endOfFile(false), m_dir("."), m_pos(0), m_threadRunning(false) {}
+      m_endOfFile(false), m_dir("."), m_pos(0), m_threadRunning(false), m_file_fd(-1) {}
 
 FrameHandlerImpl::~FrameHandlerImpl() {
+    // Close file descriptor if still open
+    if (m_file_fd >= 0) {
+        ::close(m_file_fd);
+        m_file_fd = -1;
+    }
+    
     if (m_threadWorker.joinable()) {
         m_threadWorker.join();
     }
@@ -55,6 +61,13 @@ FrameHandlerImpl::~FrameHandlerImpl() {
 
 Status FrameHandlerImpl::setOutputFilePath(const std::string &filePath) {
     Status status = Status::OK;
+    
+    // Close any previously open file descriptor
+    if (m_file_fd >= 0) {
+        ::close(m_file_fd);
+        m_file_fd = -1;
+    }
+    
     m_dir = filePath;
     m_fileCreated = false;
     return status;
@@ -71,26 +84,36 @@ Status FrameHandlerImpl::saveFrameToFile(aditof::Frame &frame,
                                          const std::string &fileName) {
     Status status = Status::OK;
 
+    // OPTIMIZATION: Use POSIX file descriptor, keep open in concat mode
     if (m_concatFrames) {
         if (!m_fileCreated) {
-            status = createFile(fileName);
-        } else {
-            m_file = std::fstream(getOutputFileFullPath(m_outputFileName),
-                                  std::ios::app | std::ios::binary);
-            m_file.seekg(std::ios::end);
+            // Open file once for all writes
+            std::string fullPath = getOutputFileFullPath(fileName.empty() ? "frames.bin" : fileName);
+            m_file_fd = ::open(fullPath.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+            
+            if (m_file_fd < 0) {
+                LOG(ERROR) << "Failed to create file: " << fullPath << " (errno=" << errno << ")";
+                return Status::GENERIC_ERROR;
+            }
+            
+            m_fileCreated = true;
+            m_outputFileName = fileName;
         }
+        // File stays open for subsequent writes (key optimization)
     } else {
-        status = createFile(fileName);
+        // Non-concat mode: create new file per frame (legacy behavior)
+        std::string fullPath = getOutputFileFullPath(fileName);
+        m_file_fd = ::open(fullPath.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
+        
+        if (m_file_fd < 0) {
+            LOG(ERROR) << "Failed to create file: " << fullPath << " (errno=" << errno << ")";
+            return Status::GENERIC_ERROR;
+        }
     }
 
     m_inputFileName = fileName;
 
-    if (status != Status::OK) {
-        LOG(ERROR) << "Failed to create file!";
-        return status;
-    }
-
-    //Store frames in file in followind order: metadata depth ab conf
+    //Store frames in file in following order: metadata depth ab conf xyz
     uint16_t *metaData;
     uint16_t *depthData;
     uint16_t *abData;
@@ -102,35 +125,69 @@ Status FrameHandlerImpl::saveFrameToFile(aditof::Frame &frame,
     Metadata metadataStruct;
     frame.getMetadataStruct(metadataStruct);
 
-    //at first we assume that we have metadata enabled by default
-    //TO DO: implement use-case where we don't have metadata
-    m_file.write(reinterpret_cast<char *>(metaData), METADATA_SIZE);
+    ssize_t written;
 
+    // Write metadata (always present, 128 bytes)
+    written = ::write(m_file_fd, metaData, METADATA_SIZE);
+    if (written != METADATA_SIZE) {
+        LOG(ERROR) << "Failed to write metadata (errno=" << errno << ")";
+        if (!m_concatFrames && m_file_fd >= 0) ::close(m_file_fd);
+        return Status::GENERIC_ERROR;
+    }
+
+    // Write depth data if enabled
     if (metadataStruct.bitsInDepth) {
         frame.getData("depth", &depthData);
-        m_file.write(reinterpret_cast<char *>(depthData),
-                     metadataStruct.width * metadataStruct.height * 2);
+        size_t depth_size = metadataStruct.width * metadataStruct.height * 2;
+        written = ::write(m_file_fd, depthData, depth_size);
+        if (written != static_cast<ssize_t>(depth_size)) {
+            LOG(ERROR) << "Failed to write depth data (errno=" << errno << ")";
+            if (!m_concatFrames && m_file_fd >= 0) ::close(m_file_fd);
+            return Status::GENERIC_ERROR;
+        }
     }
 
+    // Write AB data if enabled
     if (metadataStruct.bitsInAb) {
         frame.getData("ab", &abData);
-        m_file.write(reinterpret_cast<char *>(abData),
-                     metadataStruct.width * metadataStruct.height * 2);
+        size_t ab_size = metadataStruct.width * metadataStruct.height * 2;
+        written = ::write(m_file_fd, abData, ab_size);
+        if (written != static_cast<ssize_t>(ab_size)) {
+            LOG(ERROR) << "Failed to write AB data (errno=" << errno << ")";
+            if (!m_concatFrames && m_file_fd >= 0) ::close(m_file_fd);
+            return Status::GENERIC_ERROR;
+        }
     }
 
+    // Write confidence data if enabled (4 bytes per pixel!)
     if (metadataStruct.bitsInConfidence) {
         frame.getData("conf", &confData);
-        m_file.write(reinterpret_cast<char *>(confData),
-                     metadataStruct.width * metadataStruct.height * 4);
+        size_t conf_size = metadataStruct.width * metadataStruct.height * 4;
+        written = ::write(m_file_fd, confData, conf_size);
+        if (written != static_cast<ssize_t>(conf_size)) {
+            LOG(ERROR) << "Failed to write confidence data (errno=" << errno << ")";
+            if (!m_concatFrames && m_file_fd >= 0) ::close(m_file_fd);
+            return Status::GENERIC_ERROR;
+        }
     }
 
+    // Write XYZ data if enabled
     if (metadataStruct.xyzEnabled) {
         frame.getData("xyz", &xyzData);
-        m_file.write(reinterpret_cast<char *>(xyzData),
-                     metadataStruct.width * metadataStruct.height * 6);
+        size_t xyz_size = metadataStruct.width * metadataStruct.height * 6;
+        written = ::write(m_file_fd, xyzData, xyz_size);
+        if (written != static_cast<ssize_t>(xyz_size)) {
+            LOG(ERROR) << "Failed to write XYZ data (errno=" << errno << ")";
+            if (!m_concatFrames && m_file_fd >= 0) ::close(m_file_fd);
+            return Status::GENERIC_ERROR;
+        }
     }
 
-    m_file.close();
+    // Only close if NOT concatenating frames
+    if (!m_concatFrames && m_file_fd >= 0) {
+        ::close(m_file_fd);
+        m_file_fd = -1;
+    }
 
     if (!m_frameQueue.empty()) {
         m_mutex.lock();
