@@ -1,9 +1,12 @@
 #ifndef FLOAT_TO_LIN_H
 #define FLOAT_TO_LIN_H
 
+#include <atomic>
+
 static const uint16_t CNT = 2048;
 
 static int16_t lookup[CNT] = {0};
+static std::atomic<bool> lookup_initialized{false};
 
 static int16_t getRange(uint16_t idx) {
 
@@ -38,8 +41,20 @@ static int16_t getRange(uint16_t idx) {
 }
 
 void FloatToLinGenerateTable() {
-    for (uint16_t idx = 0; idx < CNT; idx++) {
-        lookup[idx] = getRange(idx);
+    // Thread-safe one-time initialization
+    bool expected = false;
+    if (lookup_initialized.compare_exchange_strong(expected, true)) {
+        for (uint16_t idx = 0; idx < CNT; idx++) {
+            lookup[idx] = getRange(idx);
+        }
+        // Ensure all writes are visible before other threads proceed
+        std::atomic_thread_fence(std::memory_order_release);
+    } else {
+        // Another thread is initializing or already initialized
+        // Wait for initialization to complete
+        while (!lookup_initialized.load(std::memory_order_acquire)) {
+            // Spin wait (could use std::this_thread::yield() for better behavior)
+        }
     }
 }
 

@@ -13,6 +13,7 @@
 #include <cstring>
 #include <unistd.h>
 #endif
+#include <algorithm>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 
@@ -20,6 +21,7 @@
 #define USER_TASK _IOW('A', 1, int32_t *)
 
 std::vector<std::weak_ptr<Adsd3500Sensor>> Adsd3500InterruptNotifier::m_sensors;
+std::mutex Adsd3500InterruptNotifier::m_sensorsMutex;  // CRITICAL FIX: Protect shared vector
 
 Adsd3500InterruptNotifier &Adsd3500InterruptNotifier::getInstance() {
     static auto &&notifier = Adsd3500InterruptNotifier();
@@ -32,6 +34,10 @@ void Adsd3500InterruptNotifier::signalEventHandler(int n, siginfo_t *info,
         int signal_value = info->si_int;
         DLOG(INFO) << "Received signal " << info->si_int << " from kernel";
 
+        // CRITICAL FIX: Lock mutex to prevent race conditions when iterating sensors
+        // in dual-camera setups. Without this, compiler optimizations can cache
+        // vector pointers/iterators, leading to corrupted interrupt delivery.
+        std::lock_guard<std::mutex> lock(m_sensorsMutex);
         for (auto sensor : m_sensors) {
             if (std::shared_ptr<Adsd3500Sensor> sptr = sensor.lock()) {
                 sptr->adsd3500InterruptHandler(signal_value);
@@ -80,8 +86,19 @@ bool Adsd3500InterruptNotifier::interruptsAvailable() {
 
 void Adsd3500InterruptNotifier::subscribeSensor(
     std::weak_ptr<Adsd3500Sensor> sensor) {
+    // CRITICAL FIX: Lock mutex when modifying shared vector
+    std::lock_guard<std::mutex> lock(m_sensorsMutex);
     m_sensors.emplace_back(sensor);
 }
 
 void Adsd3500InterruptNotifier::unsubscribeSensor(
-    std::weak_ptr<Adsd3500Sensor> sensor) {}
+    std::weak_ptr<Adsd3500Sensor> sensor) {
+    // CRITICAL FIX: Lock mutex when modifying shared vector
+    std::lock_guard<std::mutex> lock(m_sensorsMutex);
+    m_sensors.erase(
+        std::remove_if(m_sensors.begin(), m_sensors.end(),
+                       [&sensor](const std::weak_ptr<Adsd3500Sensor>& s) {
+                           return s.lock() == sensor.lock();
+                       }),
+        m_sensors.end());
+}

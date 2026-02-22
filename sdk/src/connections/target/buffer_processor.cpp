@@ -458,6 +458,10 @@ void BufferProcessor::processThread() {
             m_tofiComputeContext->p_conf_frame = reinterpret_cast<float *>(
                 tofi_compute_io_buff.get() +
                 numPixels * 2); // Confidence follows AB
+            
+            // CRITICAL FIX: Memory barrier to prevent compiler reordering
+            // Ensures pointer writes above are visible before TofiCompute() reads them
+            std::atomic_thread_fence(std::memory_order_release);
 #ifdef DUAL
             if (m_currentModeNumber == 0 ||
                 m_currentModeNumber ==
@@ -474,6 +478,11 @@ void BufferProcessor::processThread() {
             uint32_t ret = TofiCompute(
                 reinterpret_cast<uint16_t *>(process_frame.data.get()),
                 m_tofiComputeContext, NULL);
+            
+            // CRITICAL FIX: Acquire barrier after TofiCompute
+            // Ensures all writes by TofiCompute are visible before we restore pointers
+            std::atomic_thread_fence(std::memory_order_acquire);
+            
             if (ret != ADI_TOFI_SUCCESS) {
                 LOG(ERROR) << "processThread: TofiCompute failed";
                 m_tofi_io_Buffer_Q.push(tofi_compute_io_buff);

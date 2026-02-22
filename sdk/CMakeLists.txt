@@ -24,6 +24,14 @@ endif()
 # Add general optimization flag
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     add_compile_options(-Ofast)
+    # CRITICAL FIX: Disable strict aliasing to prevent pointer aliasing optimizations
+    # that can cause frame corruption in dual-sensor setups
+    add_compile_options(-fno-strict-aliasing)
+endif()
+
+# Also apply for RelWithDebInfo builds
+if(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+    add_compile_options(-fno-strict-aliasing)
 endif()
 
 file(GLOB SOURCES

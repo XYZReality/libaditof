@@ -32,6 +32,7 @@
 
 #include <aditof/status_definitions.h>
 #include <memory>
+#include <mutex>
 #include <signal.h>
 #include <vector>
 
@@ -62,5 +63,6 @@ class Adsd3500InterruptNotifier final {
 
   private:
     static std::vector<std::weak_ptr<Adsd3500Sensor>> m_sensors;
+    static std::mutex m_sensorsMutex;  // CRITICAL FIX: Protect shared vector
     bool m_interruptsAvailable;
 };

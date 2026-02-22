@@ -207,7 +207,7 @@ class BufferProcessor : public aditof::V4lBufferAccessInterface {
     std::thread m_processingThread;
 
     std::atomic<bool> stopThreadsFlag;
-    bool streamRunning = false;
+    std::atomic<bool> streamRunning{false};  // CRITICAL FIX: Must be atomic for thread safety
 
     static constexpr size_t MAX_QUEUE_SIZE = 3;
     static constexpr int TIME_OUT_DELAY = 5;
