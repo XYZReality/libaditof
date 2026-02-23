@@ -48,6 +48,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <cerrno>
+#include <sys/uio.h>
 
 #define METADATA_SIZE 128
 

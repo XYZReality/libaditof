@@ -50,7 +50,9 @@ FrameHandlerImpl::FrameHandlerImpl()
 FrameHandlerImpl::~FrameHandlerImpl() {
     // Close file descriptor if still open
     if (m_file_fd >= 0) {
-        ::close(m_file_fd);
+        if (::close(m_file_fd) < 0) {
+            LOG(ERROR) << "Failed to close file descriptor (errno=" << errno << ")";
+        }
         m_file_fd = -1;
     }
     
@@ -64,7 +66,9 @@ Status FrameHandlerImpl::setOutputFilePath(const std::string &filePath) {
     
     // Close any previously open file descriptor
     if (m_file_fd >= 0) {
-        ::close(m_file_fd);
+        if (::close(m_file_fd) < 0) {
+            LOG(ERROR) << "Failed to close file descriptor (errno=" << errno << ")";
+        }
         m_file_fd = -1;
     }
     
@@ -125,67 +129,78 @@ Status FrameHandlerImpl::saveFrameToFile(aditof::Frame &frame,
     Metadata metadataStruct;
     frame.getMetadataStruct(metadataStruct);
 
-    ssize_t written;
+    // OPTIMIZATION: Use writev() to batch all writes into a single syscall
+    // This reduces context switches from 5 syscalls/frame to 1 syscall/frame
+    struct iovec iov[5];
+    int iov_count = 0;
+    size_t total_bytes = METADATA_SIZE;
 
-    // Write metadata (always present, 128 bytes)
-    written = ::write(m_file_fd, metaData, METADATA_SIZE);
-    if (written != METADATA_SIZE) {
-        LOG(ERROR) << "Failed to write metadata (errno=" << errno << ")";
-        if (!m_concatFrames && m_file_fd >= 0) ::close(m_file_fd);
-        return Status::GENERIC_ERROR;
-    }
+    // Always write metadata first
+    iov[iov_count].iov_base = metaData;
+    iov[iov_count].iov_len = METADATA_SIZE;
+    iov_count++;
 
-    // Write depth data if enabled
+    // Add depth if enabled
     if (metadataStruct.bitsInDepth) {
         frame.getData("depth", &depthData);
         size_t depth_size = metadataStruct.width * metadataStruct.height * 2;
-        written = ::write(m_file_fd, depthData, depth_size);
-        if (written != static_cast<ssize_t>(depth_size)) {
-            LOG(ERROR) << "Failed to write depth data (errno=" << errno << ")";
-            if (!m_concatFrames && m_file_fd >= 0) ::close(m_file_fd);
-            return Status::GENERIC_ERROR;
-        }
+        iov[iov_count].iov_base = depthData;
+        iov[iov_count].iov_len = depth_size;
+        iov_count++;
+        total_bytes += depth_size;
     }
 
-    // Write AB data if enabled
+    // Add AB if enabled
     if (metadataStruct.bitsInAb) {
         frame.getData("ab", &abData);
         size_t ab_size = metadataStruct.width * metadataStruct.height * 2;
-        written = ::write(m_file_fd, abData, ab_size);
-        if (written != static_cast<ssize_t>(ab_size)) {
-            LOG(ERROR) << "Failed to write AB data (errno=" << errno << ")";
-            if (!m_concatFrames && m_file_fd >= 0) ::close(m_file_fd);
-            return Status::GENERIC_ERROR;
-        }
+        iov[iov_count].iov_base = abData;
+        iov[iov_count].iov_len = ab_size;
+        iov_count++;
+        total_bytes += ab_size;
     }
 
-    // Write confidence data if enabled (4 bytes per pixel!)
+    // Add confidence if enabled
     if (metadataStruct.bitsInConfidence) {
         frame.getData("conf", &confData);
         size_t conf_size = metadataStruct.width * metadataStruct.height * 4;
-        written = ::write(m_file_fd, confData, conf_size);
-        if (written != static_cast<ssize_t>(conf_size)) {
-            LOG(ERROR) << "Failed to write confidence data (errno=" << errno << ")";
-            if (!m_concatFrames && m_file_fd >= 0) ::close(m_file_fd);
-            return Status::GENERIC_ERROR;
-        }
+        iov[iov_count].iov_base = confData;
+        iov[iov_count].iov_len = conf_size;
+        iov_count++;
+        total_bytes += conf_size;
     }
 
-    // Write XYZ data if enabled
+    // Add XYZ if enabled
     if (metadataStruct.xyzEnabled) {
         frame.getData("xyz", &xyzData);
         size_t xyz_size = metadataStruct.width * metadataStruct.height * 6;
-        written = ::write(m_file_fd, xyzData, xyz_size);
-        if (written != static_cast<ssize_t>(xyz_size)) {
-            LOG(ERROR) << "Failed to write XYZ data (errno=" << errno << ")";
-            if (!m_concatFrames && m_file_fd >= 0) ::close(m_file_fd);
-            return Status::GENERIC_ERROR;
-        }
+        iov[iov_count].iov_base = xyzData;
+        iov[iov_count].iov_len = xyz_size;
+        iov_count++;
+        total_bytes += xyz_size;
     }
+
+    // Single syscall writes all frame data atomically
+    ssize_t written = ::writev(m_file_fd, iov, iov_count);
+    if (written != static_cast<ssize_t>(total_bytes)) {
+        LOG(ERROR) << "Failed to write frame data: wrote " << written 
+                   << " of " << total_bytes << " bytes (errno=" << errno << ")";
+        if (!m_concatFrames && m_file_fd >= 0) {
+            ::close(m_file_fd);
+            m_file_fd = -1;
+        }
+        return Status::GENERIC_ERROR;
+    }
+
+    // OPTIMIZATION: Tell kernel to evict written pages from cache immediately
+    // Saves RAM since we never re-read this data until after shutdown
+    posix_fadvise(m_file_fd, 0, 0, POSIX_FADV_DONTNEED);
 
     // Only close if NOT concatenating frames
     if (!m_concatFrames && m_file_fd >= 0) {
-        ::close(m_file_fd);
+        if (::close(m_file_fd) < 0) {
+            LOG(ERROR) << "Failed to close file (errno=" << errno << ")";
+        }
         m_file_fd = -1;
     }
 
