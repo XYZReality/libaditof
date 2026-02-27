@@ -37,6 +37,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <cstdint>
 
 /**
  * @brief Namespace aditof
