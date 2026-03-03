@@ -16,3 +16,15 @@ target_include_directories(${PROJECT_NAME}
     PRIVATE
         .
 )
+
+# Install the library
+install(TARGETS ${PROJECT_NAME}
+    EXPORT crc32-targets
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+)
+
+# Install the header file
+install(FILES crc.h
+    DESTINATION include
+)

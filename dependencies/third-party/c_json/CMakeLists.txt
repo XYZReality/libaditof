@@ -12,3 +12,15 @@ target_include_directories(${PROJECT_NAME}
     PRIVATE
         .
 )
+
+# Install the library
+install(TARGETS ${PROJECT_NAME}
+    EXPORT cjson-targets
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+)
+
+# Install the header file
+install(FILES cJSON.h
+    DESTINATION include
+)

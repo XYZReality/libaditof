@@ -12,3 +12,15 @@ target_include_directories(${PROJECT_NAME}
     PRIVATE
         .
 )
+
+# Install the library
+install(TARGETS ${PROJECT_NAME}
+    EXPORT command_parser-targets
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+)
+
+# Install the header file
+install(FILES command_parser.h
+    DESTINATION include
+)
