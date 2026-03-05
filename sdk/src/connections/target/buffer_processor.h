@@ -79,7 +79,7 @@ class ThreadSafeQueue {
 
     bool
     push(T item,
-         std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
+         std::chrono::milliseconds timeout = std::chrono::milliseconds(200)) {
         std::unique_lock<std::mutex> lock(mutex_);
         auto deadline = std::chrono::steady_clock::now() + timeout;
         if (!not_full_.wait_until(
@@ -106,6 +106,16 @@ class ThreadSafeQueue {
         lock.unlock();
         not_full_.notify_all();
         return true;
+    }
+
+    size_t max_size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return max_size_;
+    }
+
+    void set_max_size(size_t new_max_size) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        max_size_ = new_max_size;
     }
 
     size_t size() const {

@@ -75,14 +75,21 @@ static int xioctl(int fh, unsigned int request, void *arg) {
 }
 
 BufferProcessor::BufferProcessor()
-    : m_v4l2_input_buffer_Q(MAX_QUEUE_SIZE),
-      m_capture_to_process_Q(MAX_QUEUE_SIZE),
-      m_tofi_io_Buffer_Q(MAX_QUEUE_SIZE), m_process_done_Q(MAX_QUEUE_SIZE),
-      m_vidPropSet(false), m_processorPropSet(false), m_outputFrameWidth(0),
-      m_outputFrameHeight(0), m_tofiConfig(nullptr),
-      m_tofiComputeContext(nullptr), m_inputVideoDev(nullptr) {
+    : m_v4l2_input_buffer_Q(BufferProcessor::MAX_QUEUE_SIZE),
+      m_capture_to_process_Q(BufferProcessor::MAX_QUEUE_SIZE),
+      m_tofi_io_Buffer_Q(BufferProcessor::MAX_QUEUE_SIZE),
+      m_process_done_Q(BufferProcessor::MAX_QUEUE_SIZE), m_vidPropSet(false),
+      m_processorPropSet(false), m_outputFrameWidth(0), m_outputFrameHeight(0),
+      m_tofiConfig(nullptr), m_tofiComputeContext(nullptr),
+      m_inputVideoDev(nullptr) {
 
     m_outputVideoDev = new VideoDev();
+    stopThreadsFlag = true;
+    streamRunning = false;
+    m_v4l2_input_buffer_Q.set_max_size(BufferProcessor::MAX_QUEUE_SIZE);
+    m_capture_to_process_Q.set_max_size(BufferProcessor::MAX_QUEUE_SIZE);
+    m_tofi_io_Buffer_Q.set_max_size(BufferProcessor::MAX_QUEUE_SIZE);
+    m_process_done_Q.set_max_size(BufferProcessor::MAX_QUEUE_SIZE);
     LOG(INFO) << "BufferProcessor initialized";
 }
 
@@ -94,7 +101,6 @@ BufferProcessor::~BufferProcessor() {
 
     if (NULL != m_tofiComputeContext) {
         LOG(INFO) << "freeComputeLibrary";
-        std::lock_guard<std::mutex> tofi_lock(g_tofi_compute_mutex);
         FreeTofiCompute(m_tofiComputeContext);
         m_tofiComputeContext = NULL;
     }
@@ -182,14 +188,21 @@ aditof::Status BufferProcessor::setVideoProperties(int frameWidth,
     m_outputFrameWidth = frameWidth;
     m_outputFrameHeight = frameHeight;
 
+#ifdef NVIDIA
+    m_rawFrameBufferSize =
+        static_cast<size_t>(WidthInBytes) * HeightInBytes + WidthInBytes;
+#else
     m_rawFrameBufferSize = static_cast<size_t>(WidthInBytes) * HeightInBytes;
+#endif
     {
-        LOG(INFO) << __func__ << ": Allocating " << MAX_QUEUE_SIZE
+        LOG(INFO) << __func__ << ": Allocating "
+                  << BufferProcessor::MAX_QUEUE_SIZE
                   << " raw frame buffers, each of size " << m_rawFrameBufferSize
                   << " bytes (total: "
-                  << (MAX_QUEUE_SIZE * m_rawFrameBufferSize) / (1024.0 * 1024.0)
+                  << (BufferProcessor::MAX_QUEUE_SIZE * m_rawFrameBufferSize) /
+                         (1024.0 * 1024.0)
                   << " MB)";
-        for (int i = 0; i < MAX_QUEUE_SIZE; ++i) {
+        for (int i = 0; i < BufferProcessor::MAX_QUEUE_SIZE; ++i) {
             auto buffer =
                 std::shared_ptr<uint8_t>(new uint8_t[m_rawFrameBufferSize],
                                          std::default_delete<uint8_t[]>());
@@ -210,13 +223,14 @@ aditof::Status BufferProcessor::setVideoProperties(int frameWidth,
                         4; /* | Confidance Frame ( W * H * 4 (type: float)) | */
     m_tofiBufferSize = depthSize + abSize + confSize;
 
-    LOG(INFO) << __func__ << ": Allocating " << MAX_QUEUE_SIZE
+    LOG(INFO) << __func__ << ": Allocating " << BufferProcessor::MAX_QUEUE_SIZE
               << " ToFi buffers, each of size "
               << m_tofiBufferSize * sizeof(uint16_t) << " bytes (total: "
-              << (MAX_QUEUE_SIZE * m_tofiBufferSize * sizeof(uint16_t)) /
+              << (BufferProcessor::MAX_QUEUE_SIZE * m_tofiBufferSize *
+                  sizeof(uint16_t)) /
                      (1024.0 * 1024.0)
               << " MB)";
-    for (int i = 0; i < MAX_QUEUE_SIZE; ++i) {
+    for (int i = 0; i < BufferProcessor::MAX_QUEUE_SIZE; ++i) {
         auto buffer = std::shared_ptr<uint16_t>(
             new uint16_t[m_tofiBufferSize], std::default_delete<uint16_t[]>());
         if (!buffer) {
@@ -252,6 +266,7 @@ aditof::Status BufferProcessor::setProcessorProperties(
     if (ispEnabled) {
         uint32_t status = ADI_TOFI_SUCCESS;
         ConfigFileData calDataStruct = {calData, calDataLength};
+        std::lock_guard<std::mutex> tofi_lock(g_tofi_compute_mutex);
         if (iniFile != nullptr) {
             ConfigFileData depth_ini = {iniFile, iniFileLength};
             if (ispEnabled) {
@@ -280,7 +295,6 @@ aditof::Status BufferProcessor::setProcessorProperties(
             return aditof::Status::GENERIC_ERROR;
 
         } else {
-            std::lock_guard<std::mutex> tofi_lock(g_tofi_compute_mutex);
             m_tofiComputeContext =
                 InitTofiCompute(m_tofiConfig->p_tofi_cal_config, &status);
             if (m_tofiComputeContext == NULL || status != ADI_TOFI_SUCCESS) {
@@ -473,12 +487,26 @@ void BufferProcessor::processThread() {
 
             if (m_currentModeNumber == 0 ||
                 m_currentModeNumber ==
-                    1) { // For dual pulsatrix mode 1 and 0 confidance frame is not enabled
+                    1) { // For dual pulsatrix mode 1 and 0 confidence frame is not enabled
                 memcpy(m_tofiComputeContext->p_depth_frame,
-                       process_frame.data.get(), numPixels);
+                       process_frame.data.get(), numPixels * 2);
 
                 memcpy(m_tofiComputeContext->p_ab_frame,
-                       process_frame.data.get() + numPixels, numPixels);
+                       process_frame.data.get() + numPixels * 2, numPixels * 2);
+                memset(m_tofiComputeContext->p_conf_frame, 0, numPixels * 4);
+            } else {
+                uint32_t ret = TofiCompute(
+                    reinterpret_cast<uint16_t *>(process_frame.data.get()),
+                    m_tofiComputeContext, NULL);
+                if (ret != ADI_TOFI_SUCCESS) {
+                    LOG(ERROR) << "processThread: TofiCompute failed";
+                    m_tofi_io_Buffer_Q.push(tofi_compute_io_buff);
+                    m_v4l2_input_buffer_Q.push(process_frame.data);
+                    m_tofiComputeContext->p_depth_frame = tempDepthFrame;
+                    m_tofiComputeContext->p_ab_frame = tempAbFrame;
+                    m_tofiComputeContext->p_conf_frame = tempConfFrame;
+                    continue;
+                }
             }
 
             m_tofiComputeContext->p_depth_frame = tempDepthFrame;
@@ -491,7 +519,7 @@ void BufferProcessor::processThread() {
             // concurrently, one thread's output lands in the other sensor's buffer (tearing)
             // or corrupts the heap (SIGSEGV). All three steps - redirect, compute, restore -
             // must be atomic under the same lock.
-            auto processStart = std::chrono::high_resolution_clock::now();
+            // auto processStart = std::chrono::high_resolution_clock::now();
 
             uint32_t ret;
             {
@@ -521,11 +549,11 @@ void BufferProcessor::processThread() {
                 continue;
             }
 #endif
-            auto processEnd = std::chrono::high_resolution_clock::now();
-            std::chrono::duration<double, std::milli> processTime =
-                processEnd - processStart;
-            totalProcessTime += static_cast<long long>(processTime.count());
-            totalProcessedFrame++;
+            // auto processEnd = std::chrono::high_resolution_clock::now();
+            // std::chrono::duration<double, std::milli> processTime =
+            //     processEnd - processStart;
+            // totalProcessTime += static_cast<long long>(processTime.count());
+            // totalProcessedFrame++;
         }
 
         process_frame.tofiBuffer = tofi_compute_io_buff;
