@@ -57,9 +57,9 @@
 
 uint8_t depthComputeOpenSourceEnabled = 0;
 
-// libtofi_compute.so has global internal state (NEON work buffers, calibration
-// lookups) that is not thread-safe. Serialize all TofiCompute() calls across
-// all BufferProcessor instances to prevent concurrent access.
+// libtofi_compute.so has global state (output pointers, NEON work buffers,
+// calibration tables) that is not thread-safe across multiple sensors.
+// This mutex serializes every call that touches that state.
 static std::mutex g_tofi_compute_mutex;
 
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
@@ -461,6 +461,7 @@ void BufferProcessor::processThread() {
 
             const int numPixels = m_outputFrameWidth * m_outputFrameHeight;
 
+#ifdef DUAL
             // Map ToFi processing outputs to sections of the shared buffer
             m_tofiComputeContext->p_depth_frame =
                 tofi_compute_io_buff.get(); // Depth starts at offset 0
@@ -469,7 +470,7 @@ void BufferProcessor::processThread() {
             m_tofiComputeContext->p_conf_frame = reinterpret_cast<float *>(
                 tofi_compute_io_buff.get() +
                 numPixels * 2); // Confidence follows AB
-#ifdef DUAL
+
             if (m_currentModeNumber == 0 ||
                 m_currentModeNumber ==
                     1) { // For dual pulsatrix mode 1 and 0 confidance frame is not enabled
@@ -479,23 +480,44 @@ void BufferProcessor::processThread() {
                 memcpy(m_tofiComputeContext->p_ab_frame,
                        process_frame.data.get() + numPixels, numPixels);
             }
+
+            m_tofiComputeContext->p_depth_frame = tempDepthFrame;
+            m_tofiComputeContext->p_ab_frame = tempAbFrame;
+            m_tofiComputeContext->p_conf_frame = tempConfFrame;
 #else
+            // TofiCompute() writes results through p_depth_frame/p_ab_frame/p_conf_frame
+            // on the context struct. With multiple sensors these pointers are the shared
+            // global state inside libtofi_compute.so - if two processThreads assign them
+            // concurrently, one thread's output lands in the other sensor's buffer (tearing)
+            // or corrupts the heap (SIGSEGV). All three steps - redirect, compute, restore -
+            // must be atomic under the same lock.
             auto processStart = std::chrono::high_resolution_clock::now();
 
             uint32_t ret;
             {
                 std::lock_guard<std::mutex> tofi_lock(g_tofi_compute_mutex);
+
+                // Point output pointers at this sensor's buffer
+                m_tofiComputeContext->p_depth_frame =
+                    tofi_compute_io_buff.get();
+                m_tofiComputeContext->p_ab_frame =
+                    tofi_compute_io_buff.get() + numPixels;
+                m_tofiComputeContext->p_conf_frame = reinterpret_cast<float *>(
+                    tofi_compute_io_buff.get() + numPixels * 2);
+
                 ret = TofiCompute(
                     reinterpret_cast<uint16_t *>(process_frame.data.get()),
                     m_tofiComputeContext, NULL);
+
+                // Restore before releasing lock so the next thread sees clean state
+                m_tofiComputeContext->p_depth_frame = tempDepthFrame;
+                m_tofiComputeContext->p_ab_frame = tempAbFrame;
+                m_tofiComputeContext->p_conf_frame = tempConfFrame;
             }
             if (ret != ADI_TOFI_SUCCESS) {
                 LOG(ERROR) << "processThread: TofiCompute failed";
                 m_tofi_io_Buffer_Q.push(tofi_compute_io_buff);
                 m_v4l2_input_buffer_Q.push(process_frame.data);
-                m_tofiComputeContext->p_depth_frame = tempDepthFrame;
-                m_tofiComputeContext->p_ab_frame = tempAbFrame;
-                m_tofiComputeContext->p_conf_frame = tempConfFrame;
                 continue;
             }
 #endif
@@ -504,10 +526,6 @@ void BufferProcessor::processThread() {
                 processEnd - processStart;
             totalProcessTime += static_cast<long long>(processTime.count());
             totalProcessedFrame++;
-
-            m_tofiComputeContext->p_depth_frame = tempDepthFrame;
-            m_tofiComputeContext->p_ab_frame = tempAbFrame;
-            m_tofiComputeContext->p_conf_frame = tempConfFrame;
         }
 
         process_frame.tofiBuffer = tofi_compute_io_buff;
