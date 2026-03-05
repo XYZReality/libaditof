@@ -38,6 +38,7 @@
 #include <cmath>
 #include <fcntl.h>
 #include <fstream>
+#include <mutex>
 #include <unistd.h>
 #ifdef USE_GLOG
 #include <glog/logging.h>
@@ -55,6 +56,11 @@
 #include "buffer_processor.h"
 
 uint8_t depthComputeOpenSourceEnabled = 0;
+
+// libtofi_compute.so has global internal state (NEON work buffers, calibration
+// lookups) that is not thread-safe. Serialize all TofiCompute() calls across
+// all BufferProcessor instances to prevent concurrent access.
+static std::mutex g_tofi_compute_mutex;
 
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
 
@@ -88,6 +94,7 @@ BufferProcessor::~BufferProcessor() {
 
     if (NULL != m_tofiComputeContext) {
         LOG(INFO) << "freeComputeLibrary";
+        std::lock_guard<std::mutex> tofi_lock(g_tofi_compute_mutex);
         FreeTofiCompute(m_tofiComputeContext);
         m_tofiComputeContext = NULL;
     }
@@ -228,15 +235,18 @@ aditof::Status BufferProcessor::setProcessorProperties(
     uint16_t calDataLength, uint16_t mode, bool ispEnabled) {
 
     // Free previous compute context and config to avoid memory leaks on repeated mode changes
-    if (m_tofiComputeContext != nullptr) {
-        LOG(INFO) << __func__ << ": Freeing previous compute context.";
-        FreeTofiCompute(m_tofiComputeContext);
-        m_tofiComputeContext = nullptr;
-    }
-    if (m_tofiConfig != nullptr) {
-        LOG(INFO) << __func__ << ": Freeing previous config.";
-        FreeTofiConfig(m_tofiConfig);
-        m_tofiConfig = nullptr;
+    {
+        std::lock_guard<std::mutex> tofi_lock(g_tofi_compute_mutex);
+        if (m_tofiComputeContext != nullptr) {
+            LOG(INFO) << __func__ << ": Freeing previous compute context.";
+            FreeTofiCompute(m_tofiComputeContext);
+            m_tofiComputeContext = nullptr;
+        }
+        if (m_tofiConfig != nullptr) {
+            LOG(INFO) << __func__ << ": Freeing previous config.";
+            FreeTofiConfig(m_tofiConfig);
+            m_tofiConfig = nullptr;
+        }
     }
 
     if (ispEnabled) {
@@ -270,6 +280,7 @@ aditof::Status BufferProcessor::setProcessorProperties(
             return aditof::Status::GENERIC_ERROR;
 
         } else {
+            std::lock_guard<std::mutex> tofi_lock(g_tofi_compute_mutex);
             m_tofiComputeContext =
                 InitTofiCompute(m_tofiConfig->p_tofi_cal_config, &status);
             if (m_tofiComputeContext == NULL || status != ADI_TOFI_SUCCESS) {
@@ -471,9 +482,13 @@ void BufferProcessor::processThread() {
 #else
             auto processStart = std::chrono::high_resolution_clock::now();
 
-            uint32_t ret = TofiCompute(
-                reinterpret_cast<uint16_t *>(process_frame.data.get()),
-                m_tofiComputeContext, NULL);
+            uint32_t ret;
+            {
+                std::lock_guard<std::mutex> tofi_lock(g_tofi_compute_mutex);
+                ret = TofiCompute(
+                    reinterpret_cast<uint16_t *>(process_frame.data.get()),
+                    m_tofiComputeContext, NULL);
+            }
             if (ret != ADI_TOFI_SUCCESS) {
                 LOG(ERROR) << "processThread: TofiCompute failed";
                 m_tofi_io_Buffer_Q.push(tofi_compute_io_buff);
