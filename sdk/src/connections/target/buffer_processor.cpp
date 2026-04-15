@@ -34,7 +34,9 @@
 // Should not have duplicated code if possible.
 
 #include <algorithm>
+#ifdef __ARM_NEON
 #include <arm_neon.h>
+#endif
 #include <cmath>
 #include <fcntl.h>
 #include <fstream>

@@ -13,7 +13,9 @@
 #include "utils_ini.h"
 
 #include <algorithm>
+#ifdef __ARM_NEON
 #include <arm_neon.h>
+#endif
 #include <cmath>
 #include <fcntl.h>
 #include <fstream>
