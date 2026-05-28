@@ -503,6 +503,12 @@ aditof::Status Adsd3500Sensor::getAvailableModes(std::vector<uint8_t> &modes) {
 #endif
         modes.emplace_back(availableMode.modeNumber);
     }
+    LOG(INFO) << "[getAvailableModes] Returning " << modes.size() << " modes: " 
+              << [&]() {
+                  std::ostringstream oss;
+                  for (const auto &m : modes) oss << static_cast<int>(m) << " ";
+                  return oss.str();
+              }();
     return aditof::Status::OK;
 }
 
@@ -511,11 +517,23 @@ Adsd3500Sensor::getModeDetails(const uint8_t &mode,
                                aditof::DepthSensorModeDetails &details) {
     using namespace aditof;
     Status status = Status::OK;
+    bool modeFound = false;
     for (const auto &modeDetails : m_availableModes) {
         if (modeDetails.modeNumber == mode) {
             details = modeDetails;
+            modeFound = true;
+            LOG(INFO) << "[getModeDetails] Found mode " << static_cast<int>(mode)
+                      << ": width=" << details.baseResolutionWidth
+                      << " height=" << details.baseResolutionHeight
+                      << " isPCM=" << details.isPCM
+                      << " phases=" << static_cast<int>(details.numberOfPhases);
             break;
         }
+    }
+    if (!modeFound) {
+        LOG(ERROR) << "[getModeDetails] Mode " << static_cast<int>(mode) 
+                   << " NOT in available modes (size=" << m_availableModes.size() << ")";
+        return Status::INVALID_ARGUMENT;
     }
     return status;
 }
@@ -524,6 +542,7 @@ aditof::Status Adsd3500Sensor::setMode(const uint8_t &mode) {
     aditof::DepthSensorModeDetails modeTable;
     aditof::Status status = aditof::Status::OK;
 
+    LOG(INFO) << "[setMode] Setting mode " << static_cast<int>(mode);
     status = m_modeSelector.setControl("mode", std::to_string(mode));
     if (status != aditof::Status::OK) {
         LOG(ERROR) << "Failed to set control in modeSelector!";
@@ -1437,22 +1456,18 @@ aditof::Status Adsd3500Sensor::adsd3500_reset() {
         usleep(7000000);
     }
 #elif defined(NVIDIA)
-    struct stat st;
-    if (stat("/sys/class/gpio/PP.04/value", &st) == 0) {
-        system("echo 0 > /sys/class/gpio/PP.04/value");
+    // GPIO reset line assignments for HT_G3 OrinNX board (gpiochip0):
+    //   tof_0 (/dev/video0, i2c 7-0038) -> line 160 (PAG.04)
+    //   tof_1 (/dev/video1, i2c 2-0038) -> line  62 (PJ.04)
+    {
+        int gpioLine = (m_driverPath.find("video1") != std::string::npos) ? 62 : 160;
+        Gpio gpioReset("/dev/gpiochip0", gpioLine);
+        gpioReset.openForWrite();
+        gpioReset.writeValue(0);
         usleep(100000);
-        system("echo 1 > /sys/class/gpio/PP.04/value");
+        gpioReset.writeValue(1);
         usleep(5000000);
-    } else {
-        Gpio gpio11("/dev/gpiochip3", 11);
-        gpio11.openForWrite();
-
-        gpio11.writeValue(0);
-        usleep(100000);
-        gpio11.writeValue(1);
-        usleep(5000000);
-
-        gpio11.close();
+        gpioReset.close();
     }
 #endif
     return aditof::Status::OK;
